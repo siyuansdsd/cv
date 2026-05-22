@@ -8,6 +8,7 @@ An advanced, AI-powered tool for tailoring your CV and generating cover letters 
   - **Google Vertex AI**: Enterprise-grade performance (Priority).
   - **Google AI Studio**: Access Gemini 2.5 Pro/Flash models.
   - **OpenAI**: Support for GPT-4o/5 family models.
+  - **MiniMax**: Support for MiniMax-M2.7 via the Anthropic-compatible Token Plan API, with optional OpenAI-compatible mode.
   - **Auto-Discovery**: Automatically finds and caches available models per provider.
   - **Model Pinning**: Override automatic model selection with `--model`.
   - **Mock Data**: Fallback mode for testing without API keys.
@@ -49,14 +50,31 @@ An advanced, AI-powered tool for tailoring your CV and generating cover letters 
 
 ## Configuration
 
-Set up your API keys in your environment variables:
+Set up your API keys in `.env` or your shell environment variables. The CLI
+loads `.env` automatically when you run `python run.py`.
 
-```bash
-# For Google AI Studio
-export GEMINI_API_KEY="your-key"
+```dotenv
+# MiniMax
+MINIMAX_API_KEY="your-minimax-key"
+MINIMAX_API_FORMAT="anthropic"
+MINIMAX_BASE_URL="https://api.minimax.io/anthropic"
+MINIMAX_MAX_TOKENS="32768"
 
 # For OpenAI
-export OPENAI_API_KEY="sk-..."
+OPENAI_API_KEY="sk-..."
+
+# For Google AI Studio
+GEMINI_API_KEY="your-key"
+
+# GitHub ingestion
+GITHUB_TOKEN="ghp_..."
+```
+
+Shell environment variables still take precedence over values in `.env`.
+
+```bash
+# For one-off shell usage you can still export values directly.
+export MINIMAX_API_KEY="your-minimax-key"
 
 # For Vertex AI
 # Ensure you have run: gcloud auth application-default login
@@ -80,7 +98,15 @@ python run.py --jd SRE_Role.txt
 
 # Uses 'Agency_Template.docx' from user_content/templates/
 python run.py --jd SRE_Role.txt --template Agency_Template.docx
+
+# Generate a McDowell-style LaTeX resume
+python run.py --jd SRE_Role.txt --format latex
 ```
+
+For LaTeX output, the CLI writes a `.tex` file plus `mcdowellcv.cls` into
+`user_content/generated_cvs/`. If `lualatex` or `tectonic` is installed, it also
+attempts to compile a PDF. The cover letter is still generated as a DOCX beside
+the LaTeX CV. Use `--no-compile` to generate only the `.tex` source.
 
 ### Full Options
 
@@ -101,8 +127,12 @@ python run.py --jd SRE_Role.txt --model gpt-4o
 # Use a specific provider with model pinning
 python run.py --jd SRE_Role.txt --provider openai --model gpt-4o-mini
 
+# Use MiniMax M2.7
+python run.py --jd SRE_Role.txt --provider minimax --model MiniMax-M2.7
+
 # List available models for a provider
 python run.py --list-models --provider openai
+python run.py --list-models --provider minimax
 ```
 
 ### Arguments
@@ -112,10 +142,12 @@ python run.py --list-models --provider openai
 | `--jd` | **Required**. Job Description file or URL. | `user_content/inputs/` |
 | `--library` | Master CVs folder (DOCX/PDF). | `user_content/library/` |
 | `--template` | Custom DOCX template file. | `user_content/templates/` |
+| `--format` | Output format: `docx` or `latex` (McDowell CV). | `docx` |
+| `--no-compile` | With `--format latex`, skip PDF compilation and write only `.tex`. | |
 | `--output` | Output filename or path (supports `gs://`). | `user_content/generated_cvs/` |
 | `--github` | GitHub username for portfolio section. | |
-| `--provider` | LLM provider: `auto`, `gemini`, `vertex`, `openai`, `anthropic`, `github`. | `auto` |
-| `--model` | Pin a specific model name (e.g. `gpt-4o`, `gemini-2.5-pro`). Overrides automatic model selection. | Auto-detected |
+| `--provider` | LLM provider: `auto`, `gemini`, `vertex`, `openai`, `minimax`, `anthropic`, `github`. | `auto` |
+| `--model` | Pin a specific model name (e.g. `gpt-4o`, `gemini-2.5-pro`, `MiniMax-M2.7`). Overrides automatic model selection. | Auto-detected |
 | `--suggestions` | Comma-separated template overrides (e.g. `font,header`). | |
 | `--summarize` | Years of recent experience to detail. | `10` |
 | `--list-models`| Discover and list available models for the selected provider, then exit. | |

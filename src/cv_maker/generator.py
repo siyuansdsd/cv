@@ -18,11 +18,39 @@ Handles the generation of the final MS Word (DOCX) CV.
 """
 
 import logging
+import re
 from docx import Document
 from docx.shared import Pt
 from cv_maker.models import CVData
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_cover_letter_signature(letter_body: str, candidate_name: str = "") -> str:
+    """
+    Removes model-generated closing/signature lines.
+    The DOCX generator appends one canonical closing itself.
+    """
+    lines = [line.rstrip() for line in str(letter_body or "").splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    closing_re = re.compile(r"^(sincerely|kind regards|regards|best regards|yours sincerely|yours faithfully),?$", re.I)
+    name_re = re.compile(rf"^{re.escape(str(candidate_name or '').strip())},?$", re.I) if candidate_name else None
+
+    while lines:
+        last = lines[-1].strip()
+        if name_re and name_re.match(last):
+            lines.pop()
+            continue
+        if closing_re.match(last):
+            lines.pop()
+            continue
+        break
+
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines).strip()
 
 class CVGenerator:
     """
@@ -576,7 +604,10 @@ class CVGenerator:
                 
                 # Title, Company Line (No dates)
                 p = self.document.add_paragraph()
-                p.add_run(f"{job.title}, {job.company}").bold = True
+                heading = f"{job.title}, {job.company}"
+                if getattr(job, "dates", ""):
+                    heading = f"{heading} | {job.dates}"
+                p.add_run(heading).bold = True
                 p.paragraph_format.keep_with_next = True
                 p.paragraph_format.keep_together = True
                 
@@ -638,29 +669,21 @@ class CVGenerator:
                 p = self.document.add_paragraph('CORE COMPETENCIES', style=self.styles['h1'])
                 add_competencies()
  
-        # --- PROFESSIONAL EXPERIENCE + EARLIER CAREER EXPERIENCE ---
+        # --- PROFESSIONAL EXPERIENCE ---
         # When the template has an 'experience' section mapped, inject both
-        # detailed experience AND earlier career experience together so they
-        # appear sequentially after the mapped heading during assembly.
+        # detailed experience and earlier career experience together under
+        # the same mapped heading during assembly.
         if 'experience' in self.section_map:
             def add_all_experience():
                 add_experience()
-                if data.earlier_experience:
-                    self.document.add_paragraph()  # Spacer between sections
-                    p = self.document.add_paragraph('EARLIER CAREER EXPERIENCE', style=self.styles['h1'])
-                    p.paragraph_format.keep_with_next = True
-                    add_earlier_experience()
+                add_earlier_experience()
             self._inject_content_after(self.section_map['experience']['object'], add_all_experience)
         else:
             p = self.document.add_paragraph('PROFESSIONAL EXPERIENCE', style=self.styles['h1'])
             p.paragraph_format.keep_with_next = True
             add_experience()
+            add_earlier_experience()
             self.document.add_paragraph()  # Spacer
-            if data.earlier_experience:
-                p = self.document.add_paragraph('EARLIER CAREER EXPERIENCE', style=self.styles['h1'])
-                p.paragraph_format.keep_with_next = True
-                add_earlier_experience()
-                self.document.add_paragraph()  # Spacer
 
         # --- PROJECTS ---
         if data.projects:
@@ -751,7 +774,8 @@ class CVGenerator:
         # --- BODY ---
         # The prompt returns "Dear Hiring Manager,..." so we just dump it
         # We handle newlines by splitting
-        for paragraph in letter_body.split('\n'):
+        cleaned_body = _strip_cover_letter_signature(letter_body, data.name)
+        for paragraph in cleaned_body.split('\n'):
             if paragraph.strip():
                 p = cl_doc.add_paragraph(paragraph.strip())
                 # Just use Normal style for letter body, maybe Justified if we want?

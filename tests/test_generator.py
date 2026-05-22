@@ -14,7 +14,7 @@
 
 import unittest
 from unittest.mock import patch, MagicMock
-from cv_maker.generator import CVGenerator, CVData
+from cv_maker.generator import CVGenerator, CVData, _strip_cover_letter_signature
 
 class TestCVGenerator(unittest.TestCase):
     
@@ -58,7 +58,8 @@ class TestCVGenerator(unittest.TestCase):
         calls = [args[0] for args, _ in mock_doc.add_paragraph.call_args_list if args]
         self.assertIn("EXECUTIVE SUMMARY", calls)
         self.assertIn("PROFESSIONAL EXPERIENCE", calls)
-        self.assertIn("EARLIER CAREER EXPERIENCE", calls)
+        self.assertNotIn("EARLIER CAREER EXPERIENCE", calls)
+        self.assertIn("Brief summary", calls)
         
         # Verify save called
         mock_doc.save.assert_called_with("output.docx")
@@ -88,6 +89,39 @@ class TestCVGenerator(unittest.TestCase):
         # so we just verify the attributes were accessed/set.
         self.assertTrue(mock_format.keep_with_next)
         self.assertTrue(mock_format.widow_control)
+
+    def test_strip_cover_letter_signature(self):
+        body = "Dear Hiring Manager,\n\nBody paragraph.\n\nSincerely,\nDouglas Yang"
+
+        self.assertEqual(
+            _strip_cover_letter_signature(body, "Douglas Yang"),
+            "Dear Hiring Manager,\n\nBody paragraph."
+        )
+
+    @patch('cv_maker.generator.Document')
+    def test_generate_cover_letter_does_not_duplicate_signature(self, mock_document_class):
+        mock_doc = MagicMock()
+        mock_document_class.return_value = mock_doc
+
+        generator = CVGenerator()
+        data = CVData(
+            name="Douglas Yang",
+            title="Engineer",
+            contact_info="douglas@example.com",
+            executive_summary="Summary",
+            competencies=[],
+            experience=[],
+        )
+
+        generator.generate_cover_letter(
+            data,
+            "Dear Hiring Manager,\n\nBody paragraph.\n\nSincerely,\nDouglas Yang",
+            "cover.docx",
+        )
+
+        paragraph_texts = [args[0] for args, _ in mock_doc.add_paragraph.call_args_list if args]
+        self.assertEqual(paragraph_texts.count("Sincerely,"), 1)
+        self.assertEqual(paragraph_texts.count("Douglas Yang"), 2)  # header name + final signature
 
 if __name__ == '__main__':
     unittest.main()

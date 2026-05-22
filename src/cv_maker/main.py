@@ -65,6 +65,7 @@ from cv_maker.ingest import read_url, read_docx, ingest_library, read_pdf
 from cv_maker.ssl_helpers import get_ca_bundle, set_ca_bundle_override
 from cv_maker.llm_client import LLMClient
 from cv_maker.generator import CVGenerator
+from cv_maker.latex_generator import McDowellLatexGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,17 @@ def _resolve_path(path: str, default_subdir: str | list[str]) -> str:
             return namespaced_path
         
     return path
+
+def _cover_letter_output_path(cv_output_path: str) -> str:
+    """
+    Derives a DOCX cover-letter path from the generated CV path.
+    Works for DOCX and LaTeX/PDF CV outputs.
+    """
+    path = Path(cv_output_path)
+    if path.suffix:
+        return str(path.with_name(f"{path.stem}_CoverLetter.docx"))
+    return f"{cv_output_path}_CoverLetter.docx"
+
 def main():
     try:
         _main_cli()
@@ -232,13 +244,15 @@ def _main_cli():
     parser.add_argument("--list-models", action="store_true", help="List available auto-discovered models")
     parser.add_argument("--github", help="GitHub username to ingest (e.g., username)")
     parser.add_argument("--template", help="Path or URL to a DOCX template file")
+    parser.add_argument("--format", choices=["docx", "latex"], default="docx", help="Output format: docx or latex/McDowell PDF (default: docx)")
+    parser.add_argument("--no-compile", action="store_true", help="For --format latex, generate .tex only and skip lualatex PDF compilation")
     parser.add_argument("--suggestions", help="Comma-separated overrides for template (e.g. 'font,header')")
     parser.add_argument("--summarize", type=int, default=10, help="Years of recent experience to detail (default: 10). Older roles are summarized. Set to 0 to disable.")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase output verbosity (-v=WARNING, -vv=INFO, -vvv=DEBUG)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress status output (ERROR only)")
     parser.add_argument("--ca-bundle", help="Path to a custom CA certificate bundle for HTTPS verification (proxy environments)")
-    parser.add_argument("--provider", default="auto", choices=["auto", "gemini", "vertex", "openai", "anthropic", "github"], help="LLM provider to use (default: auto)")
-    parser.add_argument("--model", default=None, help="Specific model name to use (e.g. gpt-4o, gemini-2.5-pro). Overrides automatic model selection for the chosen provider.")
+    parser.add_argument("--provider", default="auto", choices=["auto", "gemini", "vertex", "openai", "minimax", "anthropic", "github"], help="LLM provider to use (default: auto)")
+    parser.add_argument("--model", default=None, help="Specific model name to use (e.g. gpt-4o, gemini-2.5-pro, MiniMax-M2.7). Overrides automatic model selection for the chosen provider.")
     
     args = parser.parse_args()
 
@@ -303,8 +317,8 @@ def _run_main_logic(args, parser):
             print(f"\n[!] Could not auto-discover models for provider '{client.provider}'. Ensure API key is set.\n")
         sys.exit(0)
     
-    # 0. Pre-validate Template (if provided) to fail fast / save tokens
-    if args.template:
+    # 0. Pre-validate DOCX template (if provided) to fail fast / save tokens
+    if args.template and args.format == "docx":
         template_candidate = _resolve_path(args.template, ["templates", "library", "generated_cvs"])
 
         # Just check existence for local files.
@@ -379,12 +393,13 @@ def _run_main_logic(args, parser):
     
     # Handle output path
     gcs_target = None
+    output_ext = ".docx" if args.format == "docx" else ".tex"
     if args.output.startswith("gs://"):
         gcs_target = args.output
         # If the GCS path looks like a directory (ends in /) or is just a bucket, 
         # we want to use the dynamic filename logic below.
         # Otherwise, if it's a full path (gs://bucket/file.docx), we use that basename.
-        if not gcs_target.endswith(".docx"):
+        if not gcs_target.endswith(output_ext):
             # Treating as directory/bucket, so we let the dynamic logic below run 
             # by setting args.output to default temporarily or just ensuring final_output is local
             pass 
@@ -405,45 +420,75 @@ def _run_main_logic(args, parser):
             is_gcs_dir = (gcs_target and not gcs_target.endswith(".docx"))
 
             if (is_default or is_gcs_dir) and jd_data.role_title:
-                 safe_title = re.sub(r'[^\w\s-]', '', jd_data.role_title)
+                 # Construct filename: {Company}_{Role} or just {Role}
+                 parts = []
+                 if jd_data.company_name:
+                     parts.append(jd_data.company_name)
+                 parts.append(jd_data.role_title)
+                 
+                 full_title = " ".join(parts)
+                 safe_title = re.sub(r'[^\w\s-]', '', full_title)
                  safe_title = re.sub(r'[-\s]+', '_', safe_title).strip('-_')
                  if safe_title:
-                     safe_title = safe_title[:60]
-                     final_output = os.path.join(output_dir, f"{safe_title}.docx")
+                     safe_title = safe_title[:80] # Slightly longer for company+role
+                     final_output = os.path.join(output_dir, f"{safe_title}{output_ext}")
                  else:
-                     final_output = os.path.join(output_dir, "Tailored_CV.docx")
+                     final_output = os.path.join(output_dir, f"Tailored_CV{output_ext}")
             else:
 
                  # Fallback: Use the basename of what was provided if it's not a GS path,
                  # or if we failed to get a role title.
                  # If it was a GCS directory, args.output might be the bucket string, so we default
                  if is_gcs_dir:
-                     final_output = os.path.join(output_dir, "Tailored_CV.docx")
+                     final_output = os.path.join(output_dir, f"Tailored_CV{output_ext}")
                  else:
-                     final_output = os.path.join(output_dir, os.path.basename(args.output))
+                     output_name = os.path.basename(args.output)
+                     if args.format == "latex" and output_name.endswith(".docx"):
+                         output_name = re.sub(r"\.docx$", ".tex", output_name, flags=re.IGNORECASE)
+                     final_output = os.path.join(output_dir, output_name)
 
-    logger.info(f"Generating DOCX to: {final_output}")
+    logger.info(f"Generating {args.format.upper()} to: {final_output}")
     try:
         template_path = None
         if args.template:
-            # parsing logic moved to start of script
-            # We can re-run the resolution logic or rely on a var, 
-            # but for safety let's just re-run the robust resolution
+            # Re-run robust resolution here so cover letters can reuse DOCX template
+            # styling even when the CV itself is generated as LaTeX/PDF.
             template_candidate = _resolve_path(args.template, ["templates", "library", "generated_cvs"])
 
             if template_candidate.startswith("http"):
                 template_path = download_template(template_candidate)
             else:
                 template_path = template_candidate
-        
+
         suggestions = args.suggestions.split(",") if args.suggestions else []
+
+        if args.format == "latex":
+            generator = McDowellLatexGenerator()
+            pdf_path = generator.generate(cv_data, final_output, compile_pdf=not args.no_compile)
+
+            cl_filename = _cover_letter_output_path(final_output)
+            cover_generator = CVGenerator(template_path=template_path, suggestions=suggestions)
+            cover_generator.generate_cover_letter(cv_data, cover_letter_text, cl_filename)
+
+            if gcs_target:
+                upload_to_gcs(final_output, gcs_target)
+                if pdf_path:
+                    upload_to_gcs(pdf_path, gcs_target)
+                upload_to_gcs(cl_filename, gcs_target)
+
+            # Clean up temp file if downloaded
+            if template_path and args.template and args.template.startswith("http"):
+                try:
+                    os.remove(template_path)
+                except: pass
+            logger.info("Done!")
+            return
         
         generator = CVGenerator(template_path=template_path, suggestions=suggestions)
         generator.generate(cv_data, final_output)
         
         # Generate Cover Letter
-        cl_filename = final_output.replace(".docx", "_CoverLetter.docx")
-        if not cl_filename.endswith(".docx"): cl_filename += "_CoverLetter.docx"
+        cl_filename = _cover_letter_output_path(final_output)
         
         generator.generate_cover_letter(cv_data, cover_letter_text, cl_filename)
         

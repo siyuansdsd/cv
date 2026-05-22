@@ -15,13 +15,14 @@
 
 """
 Client for interacting with Large Language Models (LLMs).
-Supports Google Vertex AI, Google AI Studio, and OpenAI.
+Supports Google Vertex AI, Google AI Studio, OpenAI, and MiniMax.
 """
 
 import os
 import json
 import time
 import logging
+import re
 from pathlib import Path
 from typing import List
 from cv_maker.models import CVData, JobDescription, Experience, EarlierExperience
@@ -29,6 +30,53 @@ from cv_maker.ssl_helpers import configure_ssl_env
 
 # Logger is configured in main.py
 logger = logging.getLogger(__name__)
+
+MINIMAX_BASE_URL = "https://api.minimax.io/v1"
+MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimax.io/anthropic"
+MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7"
+
+_TOKEN_RE = re.compile(r"[a-z0-9+#]+")
+_TITLE_ROLE_TERMS = {
+    "administrator",
+    "analyst",
+    "architect",
+    "ceo",
+    "cfo",
+    "cio",
+    "consultant",
+    "cto",
+    "developer",
+    "devops",
+    "director",
+    "engineer",
+    "head",
+    "lead",
+    "manager",
+    "programmer",
+    "scientist",
+    "specialist",
+    "sre",
+    "vp",
+}
+_TITLE_TOKEN_SYNONYMS = {
+    "ai": {"artificial", "intelligence", "ml", "machine", "learning", "llm", "genai"},
+    "artificial": {"ai", "intelligence"},
+    "intelligence": {"ai", "artificial"},
+    "ml": {"ai", "machine", "learning"},
+    "machine": {"ai", "ml", "learning"},
+    "learning": {"ai", "ml", "machine"},
+    "developer": {"engineer", "software", "programmer", "web"},
+    "engineer": {"developer", "software"},
+    "software": {"developer", "engineer", "programmer"},
+    "web": {"developer", "frontend", "front", "end", "javascript", "typescript", "react", "vue", "angular", "html", "css"},
+    "frontend": {"front", "end", "web", "ui", "react", "vue", "angular", "javascript", "typescript", "html", "css"},
+    "front": {"frontend", "web", "ui"},
+    "backend": {"back", "end", "api", "server", "node", "python"},
+    "fullstack": {"full", "stack", "frontend", "backend", "web"},
+    "full": {"fullstack", "stack"},
+    "stack": {"fullstack", "full"},
+    "cloud": {"aws", "gcp", "azure"},
+}
 
 class LLMClient:
     """
@@ -49,15 +97,116 @@ class LLMClient:
         # Set api_key for the resolved provider
         if self.provider == "openai":
             self.api_key = os.environ.get("OPENAI_API_KEY")
+        elif self.provider == "minimax":
+            self.api_key = os.environ.get("MINIMAX_API_KEY")
         elif self.provider in ("gemini", "vertex"):
             self.api_key = os.environ.get("GEMINI_API_KEY")
         else:
-            self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+            self.api_key = (
+                os.environ.get("GEMINI_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+                or os.environ.get("MINIMAX_API_KEY")
+            )
 
         if not self.api_key and self.provider not in ["vertex", "github", "anthropic"]:
             logger.warning("No API key found. LLM features will fallback to Mock Data.")
 
         logger.info(f"LLMClient initialised: provider={self.provider}, model={self.model or 'auto-select'}")
+
+    @staticmethod
+    def _tokens(text: str) -> set[str]:
+        normalized = (text or "").lower()
+        normalized = normalized.replace("front-end", "frontend")
+        normalized = normalized.replace("back-end", "backend")
+        normalized = normalized.replace("full-stack", "fullstack")
+        return set(_TOKEN_RE.findall(normalized))
+
+    @classmethod
+    def _expanded_tokens(cls, text: str) -> set[str]:
+        tokens = cls._tokens(text)
+        expanded = set(tokens)
+        for token in tokens:
+            expanded.update(_TITLE_TOKEN_SYNONYMS.get(token, set()))
+        return expanded
+
+    @staticmethod
+    def _split_slash_title(title: str) -> List[str]:
+        title = str(title or "").strip()
+        if "/" not in title:
+            return [title]
+
+        options = []
+        current = []
+        for index, char in enumerate(title):
+            if char != "/":
+                current.append(char)
+                continue
+
+            left = "".join(current).strip()
+            right = title[index + 1:].split("/", 1)[0].strip()
+            has_spaced_slash = (
+                (index > 0 and title[index - 1].isspace())
+                or (index + 1 < len(title) and title[index + 1].isspace())
+            )
+            has_role_titles = (
+                LLMClient._tokens(left) & _TITLE_ROLE_TERMS
+                and LLMClient._tokens(right) & _TITLE_ROLE_TERMS
+            )
+
+            if has_spaced_slash or has_role_titles:
+                cleaned = left.strip(" \t\r\n-–—,")
+                if cleaned:
+                    options.append(cleaned)
+                current = []
+            else:
+                current.append(char)
+
+        remainder = "".join(current).strip(" \t\r\n-–—,")
+        if remainder:
+            options.append(remainder)
+        return options if len(options) > 1 else [title]
+
+    @classmethod
+    def _select_relevant_title(cls, title: str, jd: JobDescription) -> str:
+        options = cls._split_slash_title(title)
+        if len(options) == 1:
+            return options[0]
+
+        role_text = jd.role_title or jd.summary or ""
+        skill_text = " ".join(jd.key_skills or [])
+        summary_text = jd.summary or ""
+        raw_text = (jd.raw_text or "")[:4000]
+
+        role_tokens = cls._tokens(role_text)
+        role_expanded = cls._expanded_tokens(role_text)
+        skill_expanded = cls._expanded_tokens(skill_text)
+        summary_expanded = cls._expanded_tokens(summary_text)
+        raw_expanded = cls._expanded_tokens(raw_text)
+        role_phrase = role_text.lower().strip()
+
+        best_option = options[0]
+        best_score = None
+        for option in options:
+            option_lower = option.lower()
+            option_tokens = cls._tokens(option)
+            option_expanded = cls._expanded_tokens(option)
+
+            score = 0
+            if role_phrase and (option_lower in role_phrase or role_phrase in option_lower):
+                score += 40
+            score += 15 * len(option_tokens & role_tokens)
+            score += 5 * len(option_expanded & role_expanded)
+            score += 3 * len(option_expanded & skill_expanded)
+            score += 2 * len(option_expanded & summary_expanded)
+            score += len(option_expanded & raw_expanded)
+
+            if best_score is None or score > best_score:
+                best_option = option
+                best_score = score
+
+        if best_option != title:
+            logger.debug(f"Selected slash-separated title '{best_option}' from '{title}' for target role '{jd.role_title}'")
+        return best_option
 
     def _resolve_auto_provider(self) -> str:
         """
@@ -65,9 +214,13 @@ class LLMClient:
         Explicit API keys take precedence over ambient GCP credentials (ADC).
         """
         has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+        has_minimax = bool(os.environ.get("MINIMAX_API_KEY"))
         has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
         has_gcp = bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")) or self._has_adc()
 
+        if has_minimax and not has_openai and not has_gemini and not has_gcp:
+            logger.info("Auto-detected provider: minimax (MINIMAX_API_KEY found)")
+            return "minimax"
         if has_openai and not has_gemini and not has_gcp:
             logger.info("Auto-detected provider: openai (OPENAI_API_KEY found)")
             return "openai"
@@ -78,6 +231,9 @@ class LLMClient:
             # OpenAI key present alongside GCP credentials — prefer explicit key
             logger.info("Auto-detected provider: openai (OPENAI_API_KEY found)")
             return "openai"
+        if has_minimax:
+            logger.info("Auto-detected provider: minimax (MINIMAX_API_KEY found)")
+            return "minimax"
         if has_gcp:
             logger.info("Auto-detected provider: vertex (GCP credentials found)")
             return "vertex"
@@ -216,6 +372,9 @@ class LLMClient:
             }
             """
 
+        def should_fallback_to_mock() -> bool:
+            return self.provider == "auto" or not self.api_key
+
         if not self.api_key and not self._has_adc() and not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
             return get_mock_data()
 
@@ -316,7 +475,130 @@ class LLMClient:
                     if self.provider == "vertex":
                         raise
 
-            # 2. OpenAI
+            # 2. MiniMax (Anthropic-compatible by default for Token Plan; OpenAI-compatible optional)
+            _minimax_key = os.environ.get("MINIMAX_API_KEY") or (
+                self.api_key if self.provider == "minimax" else None
+            )
+            if self.provider in ["auto", "minimax"] and _minimax_key:
+                base_url = os.environ.get("MINIMAX_BASE_URL", MINIMAX_ANTHROPIC_BASE_URL).rstrip("/")
+                api_format = os.environ.get("MINIMAX_API_FORMAT", "").strip().lower()
+                if not api_format:
+                    api_format = "anthropic" if "/anthropic" in base_url else "openai"
+                minimax_models = [self.model] if self.model else [
+                    MINIMAX_DEFAULT_MODEL,
+                    "MiniMax-M2.7-highspeed",
+                    "MiniMax-M2.5",
+                    "MiniMax-M2.1",
+                ]
+
+                if api_format == "anthropic":
+                    import requests
+                    from cv_maker.ssl_helpers import get_ca_bundle
+
+                    ca_bundle = get_ca_bundle()
+                    verify_val = ca_bundle if isinstance(ca_bundle, str) and os.path.exists(ca_bundle) else True
+                    endpoint = self._minimax_anthropic_messages_url(base_url)
+                    max_tokens = int(os.environ.get("MINIMAX_MAX_TOKENS", "32768"))
+
+                    for model_name in minimax_models:
+                        try:
+                            logger.info(f"Attempting MiniMax Anthropic model: {model_name}")
+
+                            def _gen_minimax_anthropic(m, p):
+                                _t0 = time.time()
+                                response = requests.post(
+                                    endpoint,
+                                    headers={
+                                        "X-Api-Key": _minimax_key,
+                                        "Content-Type": "application/json",
+                                        "anthropic-version": "2023-06-01",
+                                    },
+                                    json={
+                                        "model": m,
+                                        "max_tokens": max_tokens,
+                                        "system": (
+                                            "You are a precise structured-output engine. "
+                                            "No deep analysis is needed. Do not use tools. "
+                                            "Return the requested final answer directly. "
+                                            "For JSON tasks, return valid JSON only with no markdown or explanation."
+                                        ),
+                                        "messages": [{"role": "user", "content": p}],
+                                    },
+                                    timeout=240,
+                                    verify=verify_val,
+                                )
+                                response.raise_for_status()
+                                data = response.json()
+                                result = self._extract_anthropic_text(data)
+                                if not result.strip():
+                                    raise ValueError(
+                                        "MiniMax returned no text content "
+                                        f"(stop_reason={data.get('stop_reason')}, "
+                                        f"content_blocks={self._anthropic_content_block_types(data)}, "
+                                        f"usage={data.get('usage')}). "
+                                        "This usually means the model exhausted MINIMAX_MAX_TOKENS in thinking "
+                                        "before writing the final answer. Increase MINIMAX_MAX_TOKENS or use a shorter prompt."
+                                    )
+                                _elapsed = time.time() - _t0
+                                _usage = data.get("usage") if isinstance(data, dict) else None
+                                logger.info(f"MiniMax Anthropic response: model={m}, elapsed={_elapsed:.1f}s, response_chars={len(result)}")
+                                if _usage:
+                                    logger.info(f"MiniMax tokens: usage={_usage}")
+                                return result
+
+                            result = self._attempt_with_retry(_gen_minimax_anthropic, model_name, prompt)
+                            logger.info(f"_call_llm completed: total_elapsed={time.time() - _call_start:.1f}s")
+                            return result
+                        except Exception as e:
+                            last_exception = e
+                            continue
+                elif api_format == "openai":
+                    import openai
+                    import httpx
+                    from cv_maker.ssl_helpers import get_ca_bundle
+
+                    ca_bundle = get_ca_bundle()
+                    http_client = httpx.Client(
+                        timeout=httpx.Timeout(120.0),
+                        verify=ca_bundle if isinstance(ca_bundle, str) and os.path.exists(ca_bundle) else True,
+                    )
+                    client = openai.OpenAI(api_key=_minimax_key, base_url=base_url, http_client=http_client)
+
+                    for model_name in minimax_models:
+                        try:
+                            logger.info(f"Attempting MiniMax OpenAI-compatible model: {model_name}")
+
+                            def _gen_minimax_openai(m, p):
+                                _t0 = time.time()
+                                response = client.chat.completions.create(
+                                    model=m,
+                                    messages=[{"role": "user", "content": p}],
+                                    temperature=0.7,
+                                )
+                                result = response.choices[0].message.content
+                                _elapsed = time.time() - _t0
+                                _usage = getattr(response, 'usage', None)
+                                logger.info(f"MiniMax OpenAI-compatible response: model={m}, elapsed={_elapsed:.1f}s, response_chars={len(result)}")
+                                if _usage:
+                                    logger.info(f"MiniMax tokens: prompt={_usage.prompt_tokens}, completion={_usage.completion_tokens}, total={_usage.total_tokens}")
+                                return result
+
+                            result = self._attempt_with_retry(_gen_minimax_openai, model_name, prompt)
+                            logger.info(f"_call_llm completed: total_elapsed={time.time() - _call_start:.1f}s")
+                            return result
+                        except Exception as e:
+                            last_exception = e
+                            continue
+                else:
+                    raise ValueError("MINIMAX_API_FORMAT must be either 'anthropic' or 'openai'.")
+
+                if last_exception:
+                    if self.provider == "minimax":
+                        raise last_exception
+                    else:
+                        logger.warning(f"MiniMax failed: {last_exception}. Falling back...")
+
+            # 3. OpenAI
             _openai_key = os.environ.get("OPENAI_API_KEY") or (
                 self.api_key if self.api_key and self.api_key.startswith("sk-") else None
             )
@@ -333,7 +615,7 @@ class LLMClient:
 
                 # If user pinned a model, use it directly; otherwise iterate priority list
                 openai_models = [self.model] if self.model else [
-                    'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano',
+                    'gpt-5.4-mini', 'gpt-5.4', 'gpt-5.4-nano',
                     'gpt-5-mini', 'gpt-5-nano', 'gpt-5',
                     'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano',
                     'o4-mini', 'gpt-4o', 'gpt-4o-mini',
@@ -369,7 +651,7 @@ class LLMClient:
                     else:
                         logger.warning(f"OpenAI failed: {last_exception}. Falling back...")
 
-            # 3. Google GenAI (New SDK)
+            # 4. Google GenAI (New SDK)
             if self.provider in ["auto", "gemini"] and self.api_key:
                 from google import genai
                 import httpx
@@ -476,19 +758,27 @@ class LLMClient:
 
         except ImportError as e:
             logger.error(f"Missing dependency for specific provider: {e}")
-            return get_mock_data()
+            if should_fallback_to_mock():
+                return get_mock_data()
+            raise
         except Exception as e:
             logger.error(f"LLM call failed after {time.time() - _call_start:.1f}s: {e}")
-            return get_mock_data()
+            if should_fallback_to_mock():
+                return get_mock_data()
+            raise
 
     def discover_models(self, client=None) -> List[str]:
         """
         Dynamically finds available models for the active provider.
-        Supports Gemini (google-genai SDK) and OpenAI.
+        Supports Gemini (google-genai SDK), OpenAI, and MiniMax.
         """
         # --- OpenAI discovery ---
         if self.provider == "openai":
             return self._discover_openai_models()
+
+        # --- MiniMax discovery ---
+        if self.provider == "minimax":
+            return self._discover_minimax_models()
 
         # --- Gemini / Vertex discovery ---
         if not client:
@@ -568,6 +858,114 @@ class LLMClient:
             logger.warning(f"Failed to list OpenAI models: {e}")
             return []
 
+    @staticmethod
+    def _minimax_anthropic_messages_url(base_url: str) -> str:
+        base = str(base_url or MINIMAX_ANTHROPIC_BASE_URL).rstrip("/")
+        if base.endswith("/messages"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/messages"
+        return f"{base}/v1/messages"
+
+    @staticmethod
+    def _minimax_anthropic_models_url(base_url: str) -> str:
+        base = str(base_url or MINIMAX_ANTHROPIC_BASE_URL).rstrip("/")
+        if base.endswith("/models"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/models"
+        return f"{base}/v1/models"
+
+    @staticmethod
+    def _extract_anthropic_text(data: object) -> str:
+        if not isinstance(data, dict):
+            return str(data or "")
+
+        content = data.get("content", "")
+        if isinstance(content, str):
+            return content
+
+        parts = []
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif isinstance(item, dict) and "text" in item:
+                    parts.append(str(item.get("text", "")))
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _anthropic_content_block_types(data: object) -> list[str]:
+        if not isinstance(data, dict):
+            return []
+        content = data.get("content", [])
+        if not isinstance(content, list):
+            return []
+        return [
+            str(item.get("type", "unknown"))
+            for item in content
+            if isinstance(item, dict)
+        ]
+
+    def _discover_minimax_models(self) -> List[str]:
+        """Lists available MiniMax models."""
+        try:
+            from cv_maker.ssl_helpers import get_ca_bundle
+
+            api_key = os.environ.get("MINIMAX_API_KEY") or self.api_key
+            if not api_key:
+                logger.warning("No MiniMax API key found for model discovery.")
+                return []
+
+            base_url = os.environ.get("MINIMAX_BASE_URL", MINIMAX_ANTHROPIC_BASE_URL).rstrip("/")
+            api_format = os.environ.get("MINIMAX_API_FORMAT", "").strip().lower()
+            if not api_format:
+                api_format = "anthropic" if "/anthropic" in base_url else "openai"
+
+            ca_bundle = get_ca_bundle()
+            verify_val = ca_bundle if isinstance(ca_bundle, str) and os.path.exists(ca_bundle) else True
+
+            if api_format == "anthropic":
+                import requests
+
+                response = requests.get(
+                    self._minimax_anthropic_models_url(base_url),
+                    headers={
+                        "X-Api-Key": api_key,
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                    },
+                    timeout=60,
+                    verify=verify_val,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                rows = payload.get("data", []) if isinstance(payload, dict) else []
+                return sorted([row.get("id") for row in rows if isinstance(row, dict) and row.get("id")])
+
+            if api_format == "openai":
+                import openai
+                import httpx
+
+                http_client = httpx.Client(timeout=httpx.Timeout(60.0), verify=verify_val)
+                client = openai.OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+
+                models = client.models.list()
+                candidates = sorted([m.id for m in models.data if "minimax" in m.id.lower()])
+                return candidates
+
+            logger.warning("MINIMAX_API_FORMAT must be either 'anthropic' or 'openai'.")
+            return []
+
+        except ImportError:
+            logger.warning("Required package not installed. Cannot discover MiniMax models.")
+            return []
+        except Exception as e:
+            logger.warning(f"Failed to list MiniMax models: {e}")
+            return []
+
     def analyze_job_description(self, text: str) -> JobDescription:
         """
         Extracts key skills and summary from raw JD text.
@@ -577,12 +975,14 @@ class LLMClient:
         prompt = f"""
         You are an expert technical recruiter. Analyze the following Job Description.
         Extract a specific 'role_title' (e.g. 'Senior Python Engineer').
+        Extract the 'company_name' (e.g. 'Google', 'Acme Corp') if mentioned, otherwise use an empty string.
         Extract a list of 5-10 'key_skills' (technologies, methodologies) required.
         Provide a 1-sentence 'summary' of the role.
         
         Return ONLY valid JSON in this format:
         {{
             "role_title": "Title",
+            "company_name": "Company",
             "key_skills": ["Skill 1", "Skill 2"],
             "summary": "This role involves..."
         }}
@@ -596,14 +996,17 @@ class LLMClient:
             jd = JobDescription(
                 raw_text=text,
                 role_title=data.get("role_title", "Top Candidate"),
+                company_name=data.get("company_name", ""),
                 key_skills=data.get("key_skills", []),
                 summary=data.get("summary", "")
             )
-            logger.info(f"analyze_job_description completed: elapsed={time.time() - _start:.1f}s, role='{jd.role_title}', skills={len(jd.key_skills)}")
+            logger.info(f"analyze_job_description completed: elapsed={time.time() - _start:.1f}s, role='{jd.role_title}', company='{jd.company_name}', skills={len(jd.key_skills)}")
             return jd
         except json.JSONDecodeError:
             logger.error(f"Failed to decode LLM response for JD analysis (elapsed={time.time() - _start:.1f}s)")
             logger.debug(f"Raw JD analysis response: {json_str[:500]}")
+            if self.provider != "auto":
+                raise ValueError("LLM returned invalid JSON for JD analysis; refusing to continue with empty JD data.")
             return JobDescription(raw_text=text)
 
     def tailor_cv(self, master_cv_text: str, jd: JobDescription, github_context: str = "", summarize_years: int = 10) -> CVData:
@@ -629,7 +1032,7 @@ class LLMClient:
             # Rule 6: Strict summarization of older roles
             rule_6 = f"""
             6. CRITICAL: Any role that ended BEFORE {cutoff_year} MUST be placed in the separate 'earlier_experience' array.
-               For these older roles: Provide Title, Company. Provide a single detailed summary paragraph. DO NOT include dates.
+               For these older roles: Provide Title, Company, and Dates. Provide a single detailed summary paragraph.
             """
         else:
             # Default/Disable mode: Focus on relevance
@@ -642,13 +1045,14 @@ class LLMClient:
         
         RULES:
         {rule_1}
-        2. For each of these detailed roles, include 5-7 bullet points. Prioritize technical depth, specific metrics, and leadership achievements.
-        3. Rewrite the Executive Summary to be targeted, substantial, and authoritative (keep it 4-6 sentences).
-        4. Reorder/Select 'Core Competencies' to match the JD, preserving technical specificity.
-        5. TONE: Expert, Senior Executive, Technical Leader. Avoid generic fluff. Focus on "what" and "how".
+        2. JOB TITLES: If a role in the Master CV has multiple titles separated by slashes (e.g. "Senior Dev / Lead Architect"), you MUST select ONLY the one title that is most relevant to the Target Role and use it. Do not include the slashes or alternative titles.
+        3. For each of these detailed roles, include 5-7 bullet points. Prioritize technical depth, specific metrics, and leadership achievements.
+        4. Rewrite the Executive Summary to be targeted, substantial, and authoritative (keep it 4-6 sentences).
+        5. Reorder/Select 'Core Competencies' to match the JD, preserving technical specificity.
+        6. TONE: Expert, Senior Executive, Technical Leader. Avoid generic fluff. Focus on "what" and "how".
         {rule_6}
-        7. Use the TECHNICAL PORTFOLIO to substantiate skills in the 'Projects' or 'Competencies' sections, citing specific repositories where relevant.
-        8. ORDERING: Within the 'experience' array, roles MUST be ordered reverse-chronologically by end date ('Present' counts as the most recent). The 'earlier_experience' array MUST also be ordered reverse-chronologically.
+        8. Use the TECHNICAL PORTFOLIO to substantiate skills in the 'Projects' or 'Competencies' sections, citing specific repositories where relevant.
+        9. ORDERING: Within the 'experience' array, roles MUST be ordered reverse-chronologically by end date ('Present' counts as the most recent). The 'earlier_experience' array MUST also be ordered reverse-chronologically.
 
         Target Role: {jd.summary}
         Target Skills: {', '.join(jd.key_skills)}
@@ -662,7 +1066,7 @@ class LLMClient:
         {{
             "name": "Applicant Name",
             "title": "Target Title",
-            "contact_info": "Phone | Email",
+            "contact_info": "Phone | Email | Address | Website",
             "executive_summary": "Tailored summary...",
             "competencies": [["Category", "Skill string"], ...],
             "experience": [
@@ -679,6 +1083,7 @@ class LLMClient:
                 {{
                     "title": "Role Title",
                     "company": "Company",
+                    "dates": "Date range",
                     "summary": "Detailed summary paragraph..."
                 }}
             ],
@@ -686,6 +1091,8 @@ class LLMClient:
             "education": ["Degree 1"],
             "certifications": "Cert string"
         }}
+        
+        Return ONLY valid JSON. Do not include markdown, commentary, XML, or explanation.
         """
         json_str = self._clean_json(self._call_llm(prompt))
         
@@ -694,6 +1101,8 @@ class LLMClient:
 
         try:
             raw = json.loads(json_str)
+            if not isinstance(raw, dict) or not raw:
+                raise ValueError("LLM returned an empty or non-object JSON response.")
             
             # Helper to ensure 2-element tuple
             def to_tuple_2(item):
@@ -710,7 +1119,7 @@ class LLMClient:
                 clean_bullets = [to_tuple_2(b) for b in job.get("bullets", [])]
                 
                 exp_list.append(Experience(
-                    title=job.get("title", ""),
+                    title=self._select_relevant_title(job.get("title", ""), jd),
                     company=job.get("company", ""),
                     location=job.get("location", ""),
                     dates=job.get("dates", ""),
@@ -722,9 +1131,10 @@ class LLMClient:
             earlier_list = []
             for job in raw.get("earlier_experience", []):
                 earlier_list.append(EarlierExperience(
-                    title=job.get("title", ""),
+                    title=self._select_relevant_title(job.get("title", ""), jd),
                     company=job.get("company", ""),
-                    summary=job.get("summary", "")
+                    summary=job.get("summary", ""),
+                    dates=job.get("dates", "")
                 ))
             
             # Map Competencies to tuples
@@ -732,11 +1142,24 @@ class LLMClient:
             # Map Projects to tuples
             projs = [to_tuple_2(p) for p in raw.get("projects", [])]
 
+            missing_dates = []
+            for job in exp_list:
+                if not str(job.dates or "").strip():
+                    missing_dates.append(f"{job.title or 'Untitled role'} at {job.company or 'Unknown company'}")
+            for job in earlier_list:
+                if not str(job.dates or "").strip():
+                    missing_dates.append(f"{job.title or 'Untitled earlier role'} at {job.company or 'Unknown company'}")
+            if missing_dates:
+                missing_dates_message = "Missing dates for experience entries: " + "; ".join(missing_dates)
+                if self.provider != "auto":
+                    raise ValueError(missing_dates_message)
+                logger.warning(missing_dates_message)
+
             logger.info(f"tailor_cv completed: elapsed={time.time() - _start:.1f}s, experience_entries={len(exp_list)}, earlier_entries={len(earlier_list)}")
 
             return CVData(
                 name=raw.get("name", ""),
-                title=raw.get("title", ""),
+                title=self._select_relevant_title(raw.get("title", ""), jd),
                 contact_info=raw.get("contact_info", ""),
                 executive_summary=raw.get("executive_summary", ""),
                 competencies=comps,
@@ -750,6 +1173,8 @@ class LLMClient:
         except Exception as e:
             logger.error(f"Failed to map LLM response to CVData (elapsed={time.time() - _start:.1f}s): {e}")
             logger.debug(f"Raw tailor_cv response: {json_str[:500]}")
+            if self.provider != "auto":
+                raise ValueError(f"LLM returned invalid CV JSON; refusing to generate an empty CV. Details: {e}") from e
             return default_data
 
     def generate_cover_letter(self, master_cv_text: str, jd: JobDescription) -> str:
@@ -773,16 +1198,25 @@ class LLMClient:
         3. Body: Connect 2-3 specific achievements from my Master CV directly to the Key Skills required.
         4. Tone: Confident, Senior Executive, Concise.
         5. Length: 300-400 words maximum.
-        6. Format: Return ONLY the body of the letter. Do not include address blocks (the system handles that). Start with the Salutation.
+        6. Format: Return ONLY the body of the letter. Do not include address blocks, closing, signature, or my name at the end (the system handles those). Start with the Salutation.
         """
         result = self._call_llm(prompt)
         logger.info(f"generate_cover_letter completed: elapsed={time.time() - _start:.1f}s, output_chars={len(result)}")
         return result
 
     def _clean_json(self, text: str) -> str:
-        """Helper to strip code fences from LLM output"""
+        """Helper to strip reasoning tags/code fences and extract JSON."""
+        text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE)
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
         elif "```" in text:
             text = text.split("```")[1].split("```")[0]
+        text = text.strip()
+
+        if not text.startswith("{"):
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                text = text[start:end + 1]
+
         return text.strip()

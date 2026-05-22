@@ -118,7 +118,7 @@ class TestCVGeneratorAssembly(unittest.TestCase):
         self.assertEqual(paragraphs[1].text, "TEMPLATE SECTION")
         self.assertEqual(paragraphs[2].text, "INJECTED CONTENT")
     def test_generate_section_order(self):
-        """Verify generate() places sections in correct order: header → summary → competencies → experience → earlier."""
+        """Verify generate() places sections in correct order and keeps earlier roles inside experience."""
         from cv_maker.models import CVData, Experience, EarlierExperience
         import tempfile, os
 
@@ -170,21 +170,20 @@ class TestCVGeneratorAssembly(unittest.TestCase):
                     heading_indices['competencies'] = i
                 elif text == 'PROFESSIONAL EXPERIENCE':
                     heading_indices['experience'] = i
-                elif text == 'EARLIER CAREER EXPERIENCE':
-                    heading_indices['earlier'] = i
 
             # Assert correct order
             self.assertIn('summary', heading_indices, "EXECUTIVE SUMMARY heading not found")
             self.assertIn('competencies', heading_indices, "CORE COMPETENCIES heading not found")
             self.assertIn('experience', heading_indices, "PROFESSIONAL EXPERIENCE heading not found")
-            self.assertIn('earlier', heading_indices, "EARLIER CAREER EXPERIENCE heading not found")
+            self.assertNotIn('EARLIER CAREER EXPERIENCE', texts)
+            self.assertIn('Junior Engineer, Old Corp', texts)
 
             self.assertLess(heading_indices['summary'], heading_indices['competencies'],
                            "Summary must come before Competencies")
             self.assertLess(heading_indices['competencies'], heading_indices['experience'],
                            "Competencies must come before Experience")
-            self.assertLess(heading_indices['experience'], heading_indices['earlier'],
-                           "Experience must come before Earlier Experience")
+            self.assertLess(heading_indices['experience'], texts.index('Junior Engineer, Old Corp'),
+                           "Earlier roles must appear inside Professional Experience after detailed roles")
         finally:
             os.unlink(output_path)
 

@@ -22,10 +22,11 @@ from typing import List, Optional
 
 @dataclass
 class EarlierExperience:
-    """Represents a summarised early career role (no dates)."""
+    """Represents a summarised early career role."""
     title: str
     company: str
     summary: str
+    dates: str = ""
 
 @dataclass
 class Experience:
@@ -67,5 +68,6 @@ class JobDescription:
     raw_text: str
     url: Optional[str] = None
     role_title: str = ""
+    company_name: str = ""
     key_skills: List[str] = field(default_factory=list)
     summary: str = ""
