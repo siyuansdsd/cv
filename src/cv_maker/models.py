@@ -71,3 +71,5 @@ class JobDescription:
     company_name: str = ""
     key_skills: List[str] = field(default_factory=list)
     summary: str = ""
+    tech_stack_summary: str = "N/A"
+    salary_range: str = "N/A"

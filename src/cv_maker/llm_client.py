@@ -984,6 +984,8 @@ class LLMClient:
         Extract a specific 'role_title' (e.g. 'Senior Python Engineer').
         Extract the 'company_name' (e.g. 'Google', 'Acme Corp') if mentioned, otherwise use an empty string.
         Extract a list of 5-10 'key_skills' (technologies, methodologies) required.
+        Provide a 1-sentence 'tech_stack_summary' covering languages, frameworks, cloud/data/AI platforms, tools, and methodologies.
+        Extract the exact 'salary_range' or compensation range if present, otherwise use "N/A".
         Provide a 1-sentence 'summary' of the role.
         
         Return ONLY valid JSON in this format:
@@ -991,6 +993,8 @@ class LLMClient:
             "role_title": "Title",
             "company_name": "Company",
             "key_skills": ["Skill 1", "Skill 2"],
+            "tech_stack_summary": "Python, React, AWS, and LLM tooling for production AI features.",
+            "salary_range": "N/A",
             "summary": "This role involves..."
         }}
 
@@ -1005,7 +1009,9 @@ class LLMClient:
                 role_title=data.get("role_title", "Top Candidate"),
                 company_name=data.get("company_name", ""),
                 key_skills=data.get("key_skills", []),
-                summary=data.get("summary", "")
+                summary=data.get("summary", ""),
+                tech_stack_summary=data.get("tech_stack_summary") or "N/A",
+                salary_range=data.get("salary_range") or "N/A",
             )
             logger.info(f"analyze_job_description completed: elapsed={time.time() - _start:.1f}s, role='{jd.role_title}', company='{jd.company_name}', skills={len(jd.key_skills)}")
             return jd

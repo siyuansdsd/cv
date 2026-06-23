@@ -72,6 +72,36 @@ def _slug(value: str, fallback: str = "job") -> str:
     return (text or fallback)[:80]
 
 
+def _na(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text else "N/A"
+
+
+def _skills_summary(skills: list[Any]) -> str:
+    clean = [str(skill).strip() for skill in skills if str(skill).strip()]
+    return ", ".join(clean) if clean else "N/A"
+
+
+def _salary_from_text(text: str) -> str:
+    for line in text.splitlines():
+        cleaned = re.sub(r"\s+", " ", line).strip()
+        if not cleaned:
+            continue
+        lower = cleaned.lower()
+        has_salary_word = any(word in lower for word in ("salary", "compensation", "remuneration", "package", "pay range"))
+        has_currency = bool(re.search(r"(\$|aud|usd|sgd|nzd|gbp|eur)\s*\d", lower))
+        if has_salary_word and (has_currency or re.search(r"\d{2,3}\s*k\b", lower)):
+            return cleaned[:180]
+        match = re.search(
+            r"((?:AUD|USD|SGD|NZD|GBP|EUR|\$)\s*[\d,.]+(?:\s*[kK])?\s*(?:-|to|–|—)\s*(?:AUD|USD|SGD|NZD|GBP|EUR|\$)?\s*[\d,.]+(?:\s*[kK])?(?:\s*(?:per year|annually|base|package|OTE))?)",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).strip()[:180]
+    return "N/A"
+
+
 def _relative(path: Path | str | None) -> str:
     if not path:
         return ""
@@ -148,6 +178,10 @@ def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
     status = str(record.get("status") or "Generated")
     if status not in STATUS_OPTIONS:
         status = "Generated"
+    key_skills = record.get("key_skills") if isinstance(record.get("key_skills"), list) else []
+    tech_stack_summary = _na(record.get("tech_stack_summary"))
+    if tech_stack_summary == "N/A":
+        tech_stack_summary = _skills_summary(key_skills)
 
     return {
         "id": str(record.get("id") or _slug(f"{created_at}-{record.get('role', 'job')}")),
@@ -157,7 +191,9 @@ def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
         "role": str(record.get("role") or "Generated CV"),
         "status": status,
         "jd_summary": str(record.get("jd_summary") or "JD summary unavailable for this historical file."),
-        "key_skills": record.get("key_skills") if isinstance(record.get("key_skills"), list) else [],
+        "key_skills": key_skills,
+        "tech_stack_summary": tech_stack_summary,
+        "salary_range": _na(record.get("salary_range")),
         "jd_source": str(record.get("jd_source") or ""),
         "jd_input_path": str(record.get("jd_input_path") or ""),
         "output_stem": str(record.get("output_stem") or ""),
@@ -185,6 +221,86 @@ def _attach_archive_links(records: list[dict[str, Any]]) -> list[dict[str, Any]]
                 archived_files[str(label)] = archived
         record["archived_files"] = archived_files
     return records
+
+
+def _label_for_archived_path(path: str) -> tuple[str, str]:
+    name = Path(path).name
+    if name.endswith("_CoverLetter.docx"):
+        return name.removesuffix("_CoverLetter.docx"), "cover_letter"
+    suffix = Path(name).suffix.lower()
+    if suffix == ".pdf":
+        return Path(name).stem, "pdf"
+    if suffix == ".tex":
+        return Path(name).stem, "tex"
+    if suffix == ".docx":
+        return Path(name).stem, "docx"
+    return Path(name).stem, suffix.lstrip(".") or "file"
+
+
+def _archived_application_records(known_stems: set[str]) -> list[dict[str, Any]]:
+    archive_manifest = drive_archive.read_archive_manifest(ARCHIVE_MANIFEST_FILE)
+    grouped: dict[str, dict[str, Any]] = {}
+    for archive in archive_manifest.get("archives", []):
+        if not isinstance(archive, dict):
+            continue
+        archive_date = str(archive.get("date") or "")
+        for item in archive.get("files", []):
+            if not isinstance(item, dict) or not item.get("local_path"):
+                continue
+            stem, label = _label_for_archived_path(str(item["local_path"]))
+            if not stem or stem in known_stems:
+                continue
+            record = grouped.setdefault(
+                stem,
+                {
+                    "id": f"archived-{stem}",
+                    "created_at": f"{archive_date or '1970-01-01'}T00:00:00",
+                    "date": archive_date,
+                    "status": "Archived",
+                    "output_stem": stem,
+                    "files": {},
+                    "archived_files": {},
+                    "jd_summary": "Imported from archived files; original JD summary was not recorded.",
+                    "tech_stack_summary": "N/A",
+                    "salary_range": "N/A",
+                },
+            )
+            company, role = _title_from_stem(stem)
+            record["company"] = record.get("company") or company
+            record["role"] = record.get("role") or role
+            record["files"][label] = str(item["local_path"])
+            record["archived_files"][label] = {
+                **item,
+                "archive_date": archive_date,
+                "remote_dir": archive.get("remote_dir", ""),
+            }
+    return [_normalize_record(record) for record in grouped.values()]
+
+
+def persist_application_records() -> None:
+    manifest = _load_manifest()
+    existing = [_normalize_record(r) for r in manifest.get("applications", []) if isinstance(r, dict)]
+    by_stem = {str(record.get("output_stem")): record for record in existing if record.get("output_stem")}
+    by_id = {str(record.get("id")): record for record in existing if record.get("id")}
+
+    for record in list_applications():
+        stem = str(record.get("output_stem") or "")
+        existing_record = by_stem.get(stem) if stem else by_id.get(str(record.get("id")))
+        if existing_record:
+            merged_files = {**(existing_record.get("files") or {}), **(record.get("files") or {})}
+            merged_archives = {**(existing_record.get("archived_files") or {}), **(record.get("archived_files") or {})}
+            existing_record.update({k: v for k, v in record.items() if k not in {"id", "created_at", "status"}})
+            existing_record["files"] = merged_files
+            existing_record["archived_files"] = merged_archives
+            existing_record["status"] = existing_record.get("status") or record.get("status") or "Generated"
+        else:
+            existing.append(record)
+            if stem:
+                by_stem[stem] = record
+            by_id[str(record.get("id"))] = record
+
+    manifest["applications"] = [_normalize_record(record) for record in existing]
+    _save_manifest(manifest)
 
 
 def list_applications() -> list[dict[str, Any]]:
@@ -215,6 +331,8 @@ def list_applications() -> list[dict[str, Any]]:
             )
         )
 
+    known_stems = {r.get("output_stem") for r in records if r.get("output_stem")}
+    records.extend(_archived_application_records(set(str(stem) for stem in known_stems)))
     records.sort(key=_application_sort_key, reverse=True)
     return _attach_archive_links(records)
 
@@ -317,12 +435,14 @@ def _log_size() -> int:
         return 0
 
 
-def _parse_run_metadata(text: str, stdout: str) -> dict[str, Any]:
+def _parse_run_metadata(text: str, stdout: str, jd_text: str = "") -> dict[str, Any]:
     combined = f"{text}\n{stdout}"
     role = ""
     company = ""
     summary = ""
     skills: list[str] = []
+    tech_stack_summary = ""
+    salary_range = ""
     output_path = ""
     pdf_path = ""
     cover_path = ""
@@ -332,13 +452,21 @@ def _parse_run_metadata(text: str, stdout: str) -> dict[str, Any]:
         role = match.group(1).strip()
         company = match.group(2).strip()
 
-    match = re.search(r">\s*Target Role:\s*(.+)", combined)
+    match = re.search(r">\s*Target Role:\s*([^\r\n]+)", combined)
     if match:
         summary = match.group(1).strip()
 
-    match = re.search(r">\s*Key Skills:\s*(.+)", combined)
+    match = re.search(r">\s*Key Skills:\s*([^\r\n]+)", combined)
     if match:
         skills = [item.strip() for item in match.group(1).split(",") if item.strip()]
+
+    match = re.search(r">\s*Tech Stack:\s*([^\r\n]+)", combined)
+    if match:
+        tech_stack_summary = match.group(1).strip()
+
+    match = re.search(r">\s*Salary Range:\s*([^\r\n]+)", combined)
+    if match:
+        salary_range = match.group(1).strip()
 
     match = re.search(r"Generating\s+\w+\s+to:\s*(\S+)", combined)
     if match:
@@ -372,6 +500,8 @@ def _parse_run_metadata(text: str, stdout: str) -> dict[str, Any]:
         "company": company,
         "jd_summary": summary or "Generated from the submitted JD.",
         "key_skills": skills,
+        "tech_stack_summary": _na(tech_stack_summary) if tech_stack_summary else _skills_summary(skills),
+        "salary_range": _na(salary_range) if salary_range else _salary_from_text(jd_text),
         "output_stem": output_stem,
         "files": files,
     }
@@ -450,7 +580,7 @@ def run_application(payload: dict[str, Any]) -> ApplyResult:
             timeout=int(os.environ.get("CV_WEB_TIMEOUT_SECONDS", "1200")),
         )
         new_log = _read_log_from(start_offset)
-        metadata = _parse_run_metadata(new_log, completed.stdout)
+        metadata = _parse_run_metadata(new_log, completed.stdout, jd if not re.match(r"^https?://", jd) else "")
         tokens = parse_token_usage(new_log)["totals"]
 
         record = _normalize_record(
@@ -462,6 +592,8 @@ def run_application(payload: dict[str, Any]) -> ApplyResult:
                 "status": "Generated" if completed.returncode == 0 else "Archived",
                 "jd_summary": metadata["jd_summary"],
                 "key_skills": metadata["key_skills"],
+                "tech_stack_summary": metadata["tech_stack_summary"],
+                "salary_range": metadata["salary_range"],
                 "jd_source": jd if re.match(r"^https?://", jd) else "text",
                 "jd_input_path": jd_input_path,
                 "output_stem": metadata["output_stem"],
@@ -511,15 +643,21 @@ def run_archive(payload: dict[str, Any]) -> dict[str, Any]:
     if not _ARCHIVE_LOCK.acquire(blocking=False):
         raise RuntimeError("Another archive job is already running.")
     try:
+        persist_application_records()
         target = drive_archive.parse_archive_date(str(payload.get("date") or "yesterday"))
-        result = drive_archive.archive_generated_files(
-            target_date=target,
-            remote=str(payload.get("remote") or "").strip() or None,
-            source_dir=GENERATED_DIR,
-            manifest_file=ARCHIVE_MANIFEST_FILE,
-            delete_local=not bool(payload.get("keep_local")),
-            dry_run=bool(payload.get("dry_run")),
-        )
+        try:
+            result = drive_archive.archive_generated_files(
+                target_date=target,
+                remote=str(payload.get("remote") or "").strip() or None,
+                source_dir=GENERATED_DIR,
+                manifest_file=ARCHIVE_MANIFEST_FILE,
+                delete_local=not bool(payload.get("keep_local")),
+                dry_run=bool(payload.get("dry_run")),
+            )
+        except Exception:
+            persist_application_records()
+            raise
+        persist_application_records()
         files = [item.__dict__ for item in result.files]
         return {
             "date": result.date,
@@ -547,15 +685,21 @@ def run_archive_old_files(payload: dict[str, Any]) -> dict[str, Any]:
     if not _ARCHIVE_LOCK.acquire(blocking=False):
         raise RuntimeError("Another archive job is already running.")
     try:
+        persist_application_records()
         min_age_days = int(payload.get("min_age_days") or drive_archive.DEFAULT_MIN_ARCHIVE_AGE_DAYS)
-        results = drive_archive.archive_generated_files_at_least_days_old(
-            min_age_days=min_age_days,
-            remote=str(payload.get("remote") or "").strip() or None,
-            source_dir=GENERATED_DIR,
-            manifest_file=ARCHIVE_MANIFEST_FILE,
-            delete_local=True,
-            dry_run=False,
-        )
+        try:
+            results = drive_archive.archive_generated_files_at_least_days_old(
+                min_age_days=min_age_days,
+                remote=str(payload.get("remote") or "").strip() or None,
+                source_dir=GENERATED_DIR,
+                manifest_file=ARCHIVE_MANIFEST_FILE,
+                delete_local=True,
+                dry_run=False,
+            )
+        except Exception:
+            persist_application_records()
+            raise
+        persist_application_records()
         files = [
             item.__dict__
             for result in results
@@ -1074,6 +1218,34 @@ INDEX_HTML = r"""<!doctype html>
       overflow-wrap: anywhere;
     }
 
+    .detail-meta {
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+      border-top: 3px solid #14385e;
+      padding-top: 12px;
+    }
+
+    .meta-box {
+      border: 2px solid #14385e;
+      background: #04101c;
+      padding: 8px;
+      display: grid;
+      gap: 5px;
+    }
+
+    .meta-box span {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+
+    .meta-box strong, .meta-box div {
+      color: var(--text);
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+    }
+
     .modal-job {
       border: 3px solid #173a2b;
       padding: 10px;
@@ -1227,6 +1399,11 @@ INDEX_HTML = r"""<!doctype html>
         <aside class="jd-pane">
           <div class="jd-title" id="detailTitle">Select a job</div>
           <div class="jd-summary" id="detailSummary"></div>
+          <div class="detail-meta">
+            <div class="meta-box"><span>Salary Range</span><strong id="detailSalary">N/A</strong></div>
+            <div class="meta-box"><span>Tech Stack Summary</span><div id="detailTech">N/A</div></div>
+            <div class="meta-box"><span>Key Skills</span><div id="detailSkills">N/A</div></div>
+          </div>
           <div class="file-links" id="detailFiles" style="margin-top: 12px;"></div>
         </aside>
         <section class="list-pane" id="detailList"></section>
@@ -1319,6 +1496,9 @@ INDEX_HTML = r"""<!doctype html>
       if (selected) {
         $("detailTitle").textContent = `${selected.company ? selected.company + " / " : ""}${selected.role}`;
         $("detailSummary").textContent = selected.jd_summary || "No JD summary available.";
+        $("detailSalary").textContent = selected.salary_range || "N/A";
+        $("detailTech").textContent = selected.tech_stack_summary || "N/A";
+        $("detailSkills").textContent = (selected.key_skills || []).length ? selected.key_skills.join(", ") : "N/A";
         $("detailFiles").innerHTML = "";
         Object.entries(selected.files || {}).forEach(([label, path]) => {
           const link = document.createElement("a");

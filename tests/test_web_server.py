@@ -36,11 +36,13 @@ class TestWebServerData(unittest.TestCase):
             )
             (generated / "Acme_AI_Engineer.pdf").write_bytes(b"%PDF")
             manifest = root / "applications.json"
+            archive_manifest = root / "drive_archive_manifest.json"
 
             with patch.multiple(
                 web_server,
                 GENERATED_DIR=generated,
                 APPLICATIONS_FILE=manifest,
+                ARCHIVE_MANIFEST_FILE=archive_manifest,
                 PROJECT_ROOT=root.resolve(),
             ):
                 records = web_server.list_applications()
@@ -58,11 +60,13 @@ class TestWebServerData(unittest.TestCase):
             generated.mkdir()
             (generated / "Acme_AI_Engineer.tex").write_text("content", encoding="utf-8")
             manifest = root / "applications.json"
+            archive_manifest = root / "drive_archive_manifest.json"
 
             with patch.multiple(
                 web_server,
                 GENERATED_DIR=generated,
                 APPLICATIONS_FILE=manifest,
+                ARCHIVE_MANIFEST_FILE=archive_manifest,
                 PROJECT_ROOT=root.resolve(),
             ):
                 record = web_server.update_application_status("discovered-Acme_AI_Engineer", "Applied")
@@ -128,6 +132,78 @@ class TestWebServerData(unittest.TestCase):
                 records[0]["archived_files"]["pdf"]["download_link"],
                 "https://drive.google.com/mock",
             )
+            self.assertEqual(records[0]["salary_range"], "N/A")
+
+    def test_list_applications_restores_archived_only_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            generated = root / "generated_cvs"
+            generated.mkdir()
+            manifest = root / "applications.json"
+            archive_manifest = root / "drive_archive_manifest.json"
+            archive_manifest.write_text(
+                """
+                {
+                  "archives": [
+                    {
+                      "date": "2026-05-21",
+                      "remote_dir": "gdrive:CV/2026-05-21",
+                      "files": [
+                        {
+                          "name": "Acme_AI_Engineer.pdf",
+                          "local_path": "generated_cvs/Acme_AI_Engineer.pdf",
+                          "remote_path": "gdrive:CV/2026-05-21/Acme_AI_Engineer.pdf",
+                          "download_link": "https://drive.google.com/archive"
+                        }
+                      ]
+                    }
+                  ]
+                }
+                """,
+                encoding="utf-8",
+            )
+
+            with patch.multiple(
+                web_server,
+                GENERATED_DIR=generated,
+                APPLICATIONS_FILE=manifest,
+                ARCHIVE_MANIFEST_FILE=archive_manifest,
+                PROJECT_ROOT=root,
+            ):
+                records = web_server.list_applications()
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["status"], "Archived")
+            self.assertEqual(records[0]["company"], "Acme")
+            self.assertEqual(records[0]["role"], "AI Engineer")
+            self.assertEqual(records[0]["archived_files"]["pdf"]["download_link"], "https://drive.google.com/archive")
+            self.assertEqual(records[0]["tech_stack_summary"], "N/A")
+            self.assertEqual(records[0]["salary_range"], "N/A")
+
+    def test_parse_run_metadata_captures_salary_and_tech_stack(self):
+        log_text = (
+            "2026-06-23 10:00:00 INFO     > Target Role: Build AI products.\n"
+            "2026-06-23 10:00:00 INFO     > Key Skills: Python, React, AWS\n"
+            "2026-06-23 10:00:00 INFO     > Tech Stack: Python, React, and AWS for AI workflow automation.\n"
+            "2026-06-23 10:00:00 INFO     > Salary Range: AUD 120k - 150k base\n"
+            "2026-06-23 10:00:00 INFO Generating LATEX to: user_content/generated_cvs/Acme_AI_Engineer.tex\n"
+        )
+
+        metadata = web_server._parse_run_metadata(log_text, "")
+
+        self.assertEqual(metadata["key_skills"], ["Python", "React", "AWS"])
+        self.assertEqual(metadata["tech_stack_summary"], "Python, React, and AWS for AI workflow automation.")
+        self.assertEqual(metadata["salary_range"], "AUD 120k - 150k base")
+        self.assertEqual(metadata["output_stem"], "Acme_AI_Engineer")
+
+    def test_parse_run_metadata_defaults_missing_salary_to_na(self):
+        metadata = web_server._parse_run_metadata(
+            "2026-06-23 10:00:00 INFO     > Key Skills: Python, GCP\n",
+            "",
+        )
+
+        self.assertEqual(metadata["salary_range"], "N/A")
+        self.assertEqual(metadata["tech_stack_summary"], "Python, GCP")
 
     def test_run_archive_old_files_defaults_to_two_day_minimum_age(self):
         result = web_server.drive_archive.ArchiveResult(

@@ -376,6 +376,8 @@ def _run_main_logic(args, parser):
     jd_data = client.analyze_job_description(jd_text)
     logger.info(f"    > Target Role: {jd_data.summary}")
     logger.info(f"    > Key Skills: {', '.join(jd_data.key_skills)}")
+    logger.info(f"    > Tech Stack: {jd_data.tech_stack_summary or 'N/A'}")
+    logger.info(f"    > Salary Range: {jd_data.salary_range or 'N/A'}")
 
     logger.info("Tailoring CV (this may take a moment)...")
     cv_data = client.tailor_cv(master_cv_text, jd_data, summarize_years=args.summarize)
