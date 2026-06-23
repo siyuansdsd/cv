@@ -768,6 +768,7 @@ def _application_heatmap(records: list[dict[str, Any]], days: int = 365) -> list
 
 
 def dashboard_payload() -> dict[str, Any]:
+    persist_application_records()
     applications = list_applications()
     token_usage = read_token_usage()
     return {
