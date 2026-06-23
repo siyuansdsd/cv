@@ -264,17 +264,28 @@ def archive_generated_files(
                 local_path.unlink()
                 deleted = True
 
-        archived_files.append(
-            ArchiveFile(
-                name=local_path.name,
-                local_path=_relative(local_path),
-                remote_path=remote_path,
-                download_link=download_link,
-                size=stat.st_size,
-                mtime=datetime.fromtimestamp(stat.st_mtime).replace(microsecond=0).isoformat(),
-                deleted=deleted,
-            )
+        archived_file = ArchiveFile(
+            name=local_path.name,
+            local_path=_relative(local_path),
+            remote_path=remote_path,
+            download_link=download_link,
+            size=stat.st_size,
+            mtime=datetime.fromtimestamp(stat.st_mtime).replace(microsecond=0).isoformat(),
+            deleted=deleted,
         )
+        archived_files.append(archived_file)
+
+        if not dry_run:
+            _merge_archive_result(
+                ArchiveResult(
+                    date=target.isoformat(),
+                    archived_at=archived_at,
+                    remote_dir=remote_dir,
+                    dry_run=dry_run,
+                    files=[archived_file],
+                ),
+                manifest_file,
+            )
 
     result = ArchiveResult(
         date=target.isoformat(),
