@@ -26,6 +26,10 @@ An advanced, AI-powered tool for tailoring your CV and generating cover letters 
 - **Cloud Integration**:
   - **GCS Support**: Directly upload outputs to Google Cloud Storage (`gs://`).
 
+- **Local Web UI**:
+  - Pixel-style command deck for submitting JDs to the same local CLI pipeline.
+  - Application history, JD summaries, generated file links, status tracking, and token dashboard.
+
 ## Installation
 
 1. **Clone the repository**:
@@ -107,6 +111,72 @@ For LaTeX output, the CLI writes a `.tex` file plus `mcdowellcv.cls` into
 `user_content/generated_cvs/`. If `lualatex` or `tectonic` is installed, it also
 attempts to compile a PDF. The cover letter is still generated as a DOCX beside
 the LaTeX CV. Use `--no-compile` to generate only the `.tex` source.
+
+### Local Web UI
+
+The web UI is optional and does not replace the CLI. It starts a local-only
+server and calls `run.py` underneath, so generated files still land in
+`user_content/generated_cvs/`.
+
+```bash
+python web.py
+# Open http://127.0.0.1:8787
+```
+
+The page supports:
+
+- JD URL or raw JD text input.
+- Provider/model/format/library/template controls.
+- Application history discovered from existing generated CVs.
+- Status changes saved to `user_content/applications.json`.
+- Token usage dashboard parsed from `user_content/logs/cv.log`.
+- Google Drive archive links from `user_content/drive_archive_manifest.json`.
+
+### Google Drive Archive
+
+Generated files can be archived to Google Drive with `rclone`. The command
+uploads files whose local modified date matches the selected date, creates a
+date folder in Google Drive, saves the returned download links locally, then
+deletes the uploaded local files by default.
+
+One-time setup:
+
+```bash
+brew install rclone
+rclone config
+```
+
+Add the configured remote destination to `.env`:
+
+```dotenv
+GOOGLE_DRIVE_ARCHIVE_REMOTE="gdrive:CV Maker Archive"
+```
+
+Archive yesterday's generated files:
+
+```bash
+python3 archive_drive.py
+```
+
+Useful variants:
+
+```bash
+# Preview without upload or delete
+python3 archive_drive.py --date yesterday --dry-run
+
+# Upload but keep local files
+python3 archive_drive.py --date 2026-05-21 --keep-local
+
+# Archive every generated file dated two days ago or earlier, grouped by date
+python3 archive_drive.py --older-than-days 2
+
+# Override the configured remote
+python3 archive_drive.py --remote "gdrive:CV Maker Archive"
+```
+
+Archive records are saved to `user_content/drive_archive_manifest.json`. The
+web UI reads this manifest so archived Drive links remain downloadable after the
+local generated files are removed.
 
 ### Full Options
 
@@ -236,6 +306,8 @@ The project isolates user data from source code:
   - `templates/`: Default folder for custom templates.
   - `generated_cvs/`: Where tailored CVs are saved.
   - `logs/`: Application logs (`cv.log`) — created automatically.
+  - `applications.json`: Web UI application status/history state.
+  - `drive_archive_manifest.json`: Google Drive archive links for generated files.
   - `library_cache/`: Cached downloads from Cloud Drives.
   - `.model_cache.json`: Cache of discovered LLM models.
 - **`src/`**: Application source code (`cv_maker/` package).
