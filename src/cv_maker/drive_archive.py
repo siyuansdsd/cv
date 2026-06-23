@@ -129,14 +129,19 @@ def _run_rclone(
     rclone_path: str,
     runner: Runner,
 ) -> subprocess.CompletedProcess:
-    return runner(
-        [rclone_path, *args],
-        cwd=str(PROJECT_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=True,
-    )
+    command = [rclone_path, *args]
+    try:
+        return runner(
+            command,
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(f"rclone failed: {' '.join(command)}\n{details}") from exc
 
 
 def _load_manifest(path: Path = ARCHIVE_MANIFEST_FILE) -> dict[str, Any]:

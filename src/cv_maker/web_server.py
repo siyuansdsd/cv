@@ -493,8 +493,13 @@ def archive_payload() -> dict[str, Any]:
         for item in archives
         if isinstance(item, dict) and isinstance(item.get("files"), list)
     )
+    try:
+        remote = drive_archive.default_remote()
+    except Exception:
+        remote = ""
     return {
         "archives": archives,
+        "default_remote": remote,
         "summary": {
             "folders": len(archives),
             "files": total_files,
@@ -1174,13 +1179,13 @@ INDEX_HTML = r"""<!doctype html>
           <div class="panel-title">Drive Archive</div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
             <button class="pixel-btn blue" id="archivePastBtn">2+ Days</button>
-            <button class="pixel-btn blue" id="archiveBtn">Archive</button>
+            <button class="pixel-btn blue" id="archiveBtn">Date Only</button>
           </div>
         </div>
         <div class="body">
           <div class="settings">
             <div class="field"><label>Date</label><input id="archiveDate" value="yesterday"></div>
-            <div class="field"><label>Remote</label><input id="archiveRemote" placeholder="gdrive:CV Maker Archive"></div>
+            <div class="field"><label>Remote</label><input id="archiveRemote" placeholder="GDrive:CV Maker Archive"></div>
             <div class="field"><label>Mode</label><select id="archiveMode"><option value="delete">upload + delete local</option><option value="keep">upload + keep local</option><option value="dry">dry run</option></select></div>
           </div>
           <div class="archive-list" id="archiveList"></div>
@@ -1281,6 +1286,9 @@ INDEX_HTML = r"""<!doctype html>
     function renderArchives(archivesPayload) {
       const archives = (archivesPayload && archivesPayload.archives) || [];
       state.archives = archives;
+      if (archivesPayload && archivesPayload.default_remote && !$("archiveRemote").value) {
+        $("archiveRemote").value = archivesPayload.default_remote;
+      }
       const target = $("archiveList");
       target.innerHTML = "";
       if (!archives.length) {
@@ -1413,8 +1421,8 @@ INDEX_HTML = r"""<!doctype html>
 
     async function runArchive() {
       $("archiveBtn").disabled = true;
-      $("runState").textContent = "Archiving generated files...";
-      $("terminal").textContent = "Running archive command.\n";
+      $("runState").textContent = "Archiving selected date...";
+      $("terminal").textContent = "Running archive command for the selected date only.\n";
       try {
         const mode = $("archiveMode").value;
         const response = await fetch("/api/archive", {
@@ -1428,13 +1436,13 @@ INDEX_HTML = r"""<!doctype html>
           })
         });
         const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Archive failed.");
-        $("terminal").textContent = data.log || "Archive complete.";
-        $("runState").textContent = "Archive complete";
+        if (!response.ok) throw new Error(data.error || "Selected date archive failed.");
+        $("terminal").textContent = data.log || "Selected date archive complete.";
+        $("runState").textContent = "Selected date archive complete";
         await loadDashboard();
       } catch (error) {
         $("terminal").textContent += `\nERROR: ${error.message}`;
-        $("runState").textContent = "Archive failed";
+        $("runState").textContent = "Selected date archive failed";
       } finally {
         $("archiveBtn").disabled = false;
       }
